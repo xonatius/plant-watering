@@ -2,8 +2,8 @@ import time
 import RPi.GPIO as io
 
 class Pump(object):
-    forward_pin = 4
-    backward_pin = 17
+    forward_pin = 5
+    backward_pin = 6
     ml_per_second = 0.5
 
     def __init__(self):
