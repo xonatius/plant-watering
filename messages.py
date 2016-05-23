@@ -15,6 +15,10 @@ class WaterMessage(BaseMessage):
         self.plant = plant
         self.volume = volume
 
+class FillDrainMessage(WaterMessage):
+    def __init__(self, plant, volume, wait_time):
+        super(FillDrainMessage, self).__init__(plant, volume)
+        self.wait_time = wait_time
 
 class ResponseMessage(BaseMessage):
 

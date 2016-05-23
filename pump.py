@@ -9,6 +9,7 @@ class Pump(object):
     forward_pin = None
     backward_pin = None
     ml_per_second = None
+    __future = None
 
     def __init__(self, loop=None, forward_pin=None, backward_pin=None, ml_per_second=0.5, inverse=False):
         self.loop = loop
@@ -22,7 +23,10 @@ class Pump(object):
             io.setup(self.backward_pin, io.OUT)
         self.stop()
 
-    def pump(self, amount_ml):
+    def pump(self, amount_ml, on_done=None):
+        if self.__future is not None:
+            raise Exception("Pump is busy.")
+
         if amount_ml > 0:
             self.pump_forward()
         else:
@@ -31,7 +35,9 @@ class Pump(object):
         wait_time = abs(amount_ml / self.ml_per_second)
 
         if self.loop:
-            self.loop.call_later(wait_time, self.stop)
+            self.loop.call_later(wait_time, self.__on_pump_done)
+            self.__future = asyncio.Future(loop=self.loop)
+            return self.__future
         else:
             time.sleep(wait_time)
             self.stop()
@@ -39,11 +45,19 @@ class Pump(object):
     def pump_forward(self):
         self.__set_pin_state(True, False)
 
+    def is_backward_capable(self):
+        return self.backward_pin is not None
+
     def pump_backward(self):
         self.__set_pin_state(False, True)
 
     def stop(self):
         self.__set_pin_state(False, False)
+
+    def __on_pump_done(self):
+        self.stop()
+        self.__future.set_result(None)
+        self.__future = None
 
     def __set_pin_state(self, fwd_pin_state, bwd_pin_state):
         if self.forward_pin is None:
@@ -79,6 +93,17 @@ class WateringController(object):
             raise KeyError("Plant '%s' is not found. Availabile plants are: %s" % (plant, ", ".join(self.pumps.keys())))
         self.pumps[plant].pump(volume)
 
+    def fill_and_drain(self, plant, volume, wait_time):
+        if self.pumps is None:
+            raise Exception("Controller is not initialized. Use with statement to initialize controller.")
+        if plant not in self.pumps:
+            raise KeyError("Plant '%s' is not found. Availabile plants are: %s" % (plant, ", ".join(self.pumps.keys())))
+        pump = self.pumps[plant]
+        if not pump.is_backward_capable():
+            raise Exception("Pump is not capable of draining.")
+        future = pump.pump(volume)
+        future.add_done_callback(lambda f: self.loop.call_later(wait_time, lambda: pump.pump(-volume)))
+
     def __enter__(self):
         io.setmode(io.BCM)
         self.prepare_pumps()
@@ -113,10 +138,15 @@ class TcpWateringServer(object):
         try:
             data = yield from reader.readline()
             message = BaseMessage.decode(data)
-            if not isinstance(message, WaterMessage):
+            if type(message) is WaterMessage:
+                self.watering_controller.water(message.plant, message.volume)
+                response = ResponseMessage(False, "Pouring %.2f ml of water for %s" % (message.volume, message.plant))
+            elif type(message) is FillDrainMessage:
+                self.watering_controller.fill_and_drain(message.plant, message.volume, message.wait_time)
+                response = ResponseMessage(False, "Filling %s with %.2f ml of water. Will drain after %d seconds." %
+                        (message.plant, message.volume, message.wait_time))
+            else:
                 raise Exception("Unknown message type.")
-            self.watering_controller.water(message.plant, message.volume)
-            response = ResponseMessage(False, "Pouring %.2f ml of water for %s" % (message.volume, message.plant))
         except Exception as e:
             traceback.print_exc()
             response = ResponseMessage(True, "Error: %s" % e)
