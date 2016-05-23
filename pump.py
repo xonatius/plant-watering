@@ -1,6 +1,8 @@
 import time, json
 import asyncio
+import traceback
 import RPi.GPIO as io
+from messages import *
 
 class Pump(object):
     loop = None
@@ -56,70 +58,86 @@ class Pump(object):
             io.output(self.backward_pin, bwd_pin_state != self.inverse)
 
 
-def create_pumps(loop):
-    return {
-            "Succulent" : Pump(loop, forward_pin=17, ml_per_second=1.0, inverse=True),
-            "Pineapple Right" : Pump(loop, forward_pin=27, ml_per_second=1.0, inverse=True),
-            "Pineapple Left" : Pump(loop, forward_pin=22, ml_per_second=1.0, inverse=True),
-            "Basil" : Pump(loop, forward_pin=23, ml_per_second=1.0, inverse=True),
-            "Empty" : Pump(loop, forward_pin=24, ml_per_second=1.0, inverse=True),
-            "Orchid" : Pump(loop, forward_pin=5, backward_pin=6, ml_per_second=0.5, inverse=False),
-            }
+class WateringController(object):
+    pumps = None
+    loop = None
+    plants_pump_config = None
 
-loop = None
-pumps = None
+    def __init__(self, loop, plants_pump_config):
+        self.loop = loop
+        self.plants_pump_config = plants_pump_config
 
-def parse_message(message):
-    try:
-        message = json.loads(message)
-        if 'plant' not in message:
-            raise Exception("No 'plant' or 'volume' in message.")
-        if 'volume' not in message:
-            raise Exception("No 'plant' or 'volume' in message.")
-        plant = message['plant']
-        if plant not in pumps:
-            raise Exception("Can't find plant '%s', availible plants are: %s" % (plant, ", ".join(pumps.keys())))
-        volume = float(message['volume'])
-        return plant, volume
-    except ValueError:
-        raise Exception("Not valid messge. Should be a json object.")
+    def prepare_pumps(self):
+        self.pumps = {}
+        for plant, config in self.plants_pump_config.items():
+            self.pumps[plant] = Pump(self.loop, **config)
+
+    def water(self, plant, volume):
+        if self.pumps is None:
+            raise Exception("Controller is not initialized. Use with statement to initialize controller.")
+        if plant not in self.pumps:
+            raise KeyError("Plant '%s' is not found. Availabile plants are: %s" % (plant, ", ".join(self.pumps.keys())))
+        self.pumps[plant].pump(volume)
+
+    def __enter__(self):
+        io.setmode(io.BCM)
+        self.prepare_pumps()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        try:
+            if self.pumps:
+                for pump in self.pumps.values():
+                    pump.stop()
+        except:
+            pass
+        finally:
+            io.cleanup()
 
 
-@asyncio.coroutine
-def handle_watering(reader, writer):
-    try:
-        data = yield from reader.read(200)
-        message = data.decode()
-        addr = writer.get_extra_info('peername')
-        print("Received %r from %r" % (message, addr))
-        plant, volume = parse_message(message)
-        pumps[plant].pump(volume)
-        writer.write(("Pouring %.2f ml of water for '%s'" % (volume, plant)).encode())
-    except Exception as e:
-        writer.write(("Error while parsing: %s" % e).encode())
-    finally:
-        yield from writer.drain()
-        writer.close()
+class TcpWateringServer(object):
+    loop = None
+    watering_controller = None
+    server = None
+
+    def __init__(self, loop, watering_controller):
+        self.loop = loop
+        self.watering_controller = watering_controller
+        coro = asyncio.start_server(self.handle_request, '127.0.0.1', 8888, loop=self.loop)
+        self.server = self.loop.run_until_complete(coro)
+        print('Serving on {}'.format(self.server.sockets[0].getsockname()))
+
+    @asyncio.coroutine
+    def handle_request(self, reader, writer):
+        response = ResponseMessage(True, "Internal error")
+        try:
+            data = yield from reader.readline()
+            message = BaseMessage.decode(data)
+            if not isinstance(message, WaterMessage):
+                raise Exception("Unknown message type.")
+            self.watering_controller.water(message.plant, message.volume)
+            response = ResponseMessage(False, "Pouring %.2f ml of water for %s" % (message.volume, message.plant))
+        except Exception as e:
+            traceback.print_exc()
+            response = ResponseMessage(True, "Error: %s" % e)
+        finally:
+            writer.write(response.encode())
+            yield from writer.drain()
+            writer.close()
+
+    def close(self):
+        self.server.close()
+        self.loop.run_until_complete(self.server.wait_closed())
 
 
 if __name__ == '__main__':
-    try:
-        io.setmode(io.BCM)
-        loop = asyncio.get_event_loop()
-        pumps = create_pumps(loop)
-        coro = asyncio.start_server(handle_watering, '127.0.0.1', 8888, loop=loop)
-        server = loop.run_until_complete(coro)
-        print('Serving on {}'.format(server.sockets[0].getsockname()))
+    from plants import plants_pumps_config
+    loop = asyncio.get_event_loop()
+    with WateringController(loop, plants_pumps_config) as watering_controller:
+        server = TcpWateringServer(loop, watering_controller)
         try:
             loop.run_forever()
         except KeyboardInterrupt:
             pass
         server.close()
-        loop.run_until_complete(server.wait_closed())
-        loop.close()
-    finally:
-        try:
-            for pump in pumps.values():
-                pump.stop()
-        finally:
-            io.cleanup()
+    loop.close()
